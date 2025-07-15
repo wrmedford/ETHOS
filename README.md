@@ -7,8 +7,6 @@ This repository contains the implementation of ETHOS from the paper "Why Play th
 
 ETHOS is a novel architecture that dynamically generates millions of tiny experts from compressed latent representations, achieving 8.7B parameter capacity while using ~20× fewer FLOPs.
 
-> **📜 License**: This project is licensed under AGPLv3. For commercial licensing options, contact wryanmedford@gmail.com
-
 ## Installation
 
 ```bash
