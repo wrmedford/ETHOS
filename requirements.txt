@@ -1,0 +1,12 @@
+torch>=2.0.0
+transformers
+datasets
+tiktoken
+triton>=2.1.0
+flash-attn>=2.0.0
+deepspeed
+wandb
+matplotlib
+pandas
+numpy
+tqdm
