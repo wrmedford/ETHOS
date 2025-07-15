@@ -85,7 +85,7 @@ Training progress is automatically logged and visualized:
 ## Paper Results
 
 On 1% of C4 dataset:
-- Perplexity: 34.85 after 4B tokens
+- Perplexity: 34.85 after 4B tokens using c100k tokenizer
 - Training speed: 15K tokens/second on GH200
 - Memory efficiency: 16× reduction vs PEER
 
