@@ -1,4 +1,4 @@
-```markdown
+
 # ETHOS: Efficient Transformers via Hypernetwork-Organized Sparsity
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
@@ -45,7 +45,7 @@ python train.py --config configs/default.yaml
 
 ETHOS combines several key innovations:
 - **Dynamic expert generation**: Instead of storing millions of expert parameters, we generate them from 128-dimensional latent codes
-- **Product-key routing**: Efficient O(√N) routing to 262K experts per layer
+- **Product-key routing**: Efficient O(√N) routing to 262K experts per layer utilizing Query BatchNorm from PEER
 - **Reordered execution**: Custom Triton kernel achieving 8× speedup
 
 ### Repository Structure
@@ -111,6 +111,3 @@ This project is licensed under the **GNU Affero General Public License v3.0 (AGP
 ### Commercial Licensing
 
 For commercial use cases that require a different license, please contact **wryanmedford@gmail.com** to discuss commercial licensing options.
-
-See [NOTICE.md](NOTICE.md) for more details about licensing terms.
-```
