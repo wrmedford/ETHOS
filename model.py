@@ -264,6 +264,77 @@ class FFN(nn.Module):
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+class SimplifiedHypernetMoE(nn.Module):
+    """
+    Simplified pure PyTorch implementation of the hypernetwork MoE layer.
+    This version doesn't use the reordered execution pattern and is easier
+    to understand, though less efficient than the Triton kernel version
+    Only suitable for toy scale models.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.d_model = config.d_model
+        self.num_experts = config.num_experts
+        self.top_k = config.top_k
+        self.num_heads = config.num_routing_heads
+        self.d_latent = config.d_latent
+        self.d_hidden = config.d_intermediate_hypernet
+        
+        self.expert_latents = nn.Embedding(config.num_experts, config.d_latent)
+        self.generation_network = ExpertGenerationNetwork(
+            config.d_latent, config.d_model, config.d_intermediate_hypernet
+        )
+        self.router = ProductKeyRouter(config)
+        
+    def forward(self, x):
+        batch_size, seq_len, d_model = x.shape
+        x_flat = x.view(-1, d_model)  # [B*S, d_model]
+        n_tokens = x_flat.shape[0]
+        
+        # Get routing decisions
+        scores, expert_indices = self.router(x_flat)  # [B*S, num_heads, top_k]
+        
+        # Process all heads at once
+        # Reshape to process all experts across all heads
+        all_indices = expert_indices.view(-1)  # [B*S*H*K]
+        all_scores = scores.view(n_tokens, -1)  # [B*S, H*K]
+        
+        # Get all latent codes at once
+        all_latents = self.expert_latents(all_indices)  # [B*S*H*K, d_latent]
+        
+        # Generate all expert parameters at once
+        all_params = self.generation_network(all_latents)  # [B*S*H*K, 2*d_model]
+        
+        # Reshape to separate w_in and w_out
+        all_params = all_params.view(n_tokens, self.num_heads * self.top_k, 2 * d_model)
+        w_in = all_params[:, :, :d_model]  # [B*S, H*K, d_model]
+        w_out = all_params[:, :, d_model:]  # [B*S, H*K, d_model]
+        
+        # Compute activations for all experts at once
+        # x_flat: [B*S, d_model] -> [B*S, 1, d_model]
+        # w_in: [B*S, H*K, d_model] -> [B*S, H*K, d_model]
+        x_expanded = x_flat.unsqueeze(1)  # [B*S, 1, d_model]
+        
+        # Batch matrix multiply: [B*S, H*K, d_model] @ [B*S, d_model, 1] -> [B*S, H*K, 1]
+        activations = torch.bmm(w_in, x_expanded.transpose(1, 2)).squeeze(-1)  # [B*S, H*K]
+        activations = F.gelu(activations)
+        
+        # Apply routing scores
+        weighted_activations = activations * all_scores  # [B*S, H*K]
+        
+        # Compute output: w_out * weighted_activations
+        # w_out: [B*S, H*K, d_model]
+        # weighted_activations: [B*S, H*K] -> [B*S, H*K, 1]
+        weighted_activations = weighted_activations.unsqueeze(-1)  # [B*S, H*K, 1]
+        expert_outputs = w_out * weighted_activations  # [B*S, H*K, d_model]
+        
+        # Sum over all experts (across heads and top-k)
+        output = expert_outputs.sum(dim=1)  # [B*S, d_model]
+        
+        # Average across heads
+        output = output / self.num_heads
+        
+        return output.view(batch_size, seq_len, d_model)
 
 class TransformerBlock(nn.Module):
     def __init__(self, config, is_moe_layer):
@@ -271,8 +342,12 @@ class TransformerBlock(nn.Module):
         self.self_attn = DeepseekV3Attention(config)
         # Import FusedLowRankMoE_Reordered from kernels.py when needed
         if is_moe_layer:
-            from kernels import FusedLowRankMoE_Reordered
-            self.mlp = FusedLowRankMoE_Reordered(config)
+            if config.use_triton:
+                from kernels import FusedLowRankMoE_Reordered
+                self.mlp = FusedLowRankMoE_Reordered(config)
+            else:
+                self.mlp = SimplifiedHypernetMoE(config)
+        # If not a MoE layer, use standard FFN
         else:
             self.mlp = FFN(config)
         self.input_layernorm = DeepseekV3RMSNorm(config.d_model, eps=config.rms_norm_eps)
