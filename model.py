@@ -288,51 +288,51 @@ class SimplifiedHypernetMoE(nn.Module):
         
     def forward(self, x):
         batch_size, seq_len, d_model = x.shape
-        x_flat = x.view(-1, d_model)  # [B*S, d_model]
+        x_flat = x.view(-1, d_model)
         n_tokens = x_flat.shape[0]
         
         # Get routing decisions
-        scores, expert_indices = self.router(x_flat)  # [B*S, num_heads, top_k]
+        scores, expert_indices = self.router(x_flat)
         
-        # Process all heads at once
-        # Reshape to process all experts across all heads
-        all_indices = expert_indices.view(-1)  # [B*S*H*K]
-        all_scores = scores.view(n_tokens, -1)  # [B*S, H*K]
+        # Get the generation network's weights (matching Triton)
+        W1 = self.generation_network.net[0].weight.t()  # [d_latent, d_hidden]
+        W2 = self.generation_network.net[2].weight.t()  # [d_hidden, 2*d_model]
         
-        # Get all latent codes at once
+        # Split W2 into projection matrices
+        W_u = W2[:, :d_model].t()     # [d_model, d_hidden]
+        W_v = W2[:, d_model:]         # [d_hidden, d_model]
+        
+        # Process all experts
+        all_indices = expert_indices.view(-1)
+        all_scores = scores.view(n_tokens, -1)
+        
+        # Get latent codes
         all_latents = self.expert_latents(all_indices)  # [B*S*H*K, d_latent]
         
-        # Generate all expert parameters at once
-        all_params = self.generation_network(all_latents)  # [B*S*H*K, 2*d_model]
+        # Generate hidden representations (not full parameters!)
+        # h = GELU(latent @ W1)
+        h = F.gelu(all_latents @ W1)  # [B*S*H*K, d_hidden]
+        h = h.view(n_tokens, self.num_heads * self.top_k, -1)  # [B*S, H*K, d_hidden]
         
-        # Reshape to separate w_in and w_out
-        all_params = all_params.view(n_tokens, self.num_heads * self.top_k, 2 * d_model)
-        w_in = all_params[:, :, :d_model]  # [B*S, H*K, d_model]
-        w_out = all_params[:, :, d_model:]  # [B*S, H*K, d_model]
+        # Project input to hidden space ONCE per token
+        x_proj = x_flat @ W_u  # [B*S, d_hidden]
         
-        # Compute activations for all experts at once
-        # x_flat: [B*S, d_model] -> [B*S, 1, d_model]
-        # w_in: [B*S, H*K, d_model] -> [B*S, H*K, d_model]
-        x_expanded = x_flat.unsqueeze(1)  # [B*S, 1, d_model]
-        
-        # Batch matrix multiply: [B*S, H*K, d_model] @ [B*S, d_model, 1] -> [B*S, H*K, 1]
-        activations = torch.bmm(w_in, x_expanded.transpose(1, 2)).squeeze(-1)  # [B*S, H*K]
-        activations = F.gelu(activations)
+        # Compute activations in hidden space
+        # activation = GELU(h · x_proj)
+        x_proj_expanded = x_proj.unsqueeze(1)  # [B*S, 1, d_hidden]
+        dot_products = (h * x_proj_expanded).sum(dim=-1)  # [B*S, H*K]
+        activations = F.gelu(dot_products)
         
         # Apply routing scores
         weighted_activations = activations * all_scores  # [B*S, H*K]
         
-        # Compute output: w_out * weighted_activations
-        # w_out: [B*S, H*K, d_model]
-        # weighted_activations: [B*S, H*K] -> [B*S, H*K, 1]
-        weighted_activations = weighted_activations.unsqueeze(-1)  # [B*S, H*K, 1]
-        expert_outputs = w_out * weighted_activations  # [B*S, H*K, d_model]
+        # Project back to token space
+        # output = sum((h @ W_v) * activation)
+        h_projected = h @ W_v  # [B*S, H*K, d_model]
+        weighted_outputs = h_projected * weighted_activations.unsqueeze(-1)
         
-        # Sum over all experts (across heads and top-k)
-        output = expert_outputs.sum(dim=1)  # [B*S, d_model]
-        
-        # Average across heads
-        output = output / self.num_heads
+        # Sum over all experts and average across heads
+        output = weighted_outputs.sum(dim=1) / self.num_heads
         
         return output.view(batch_size, seq_len, d_model)
 
