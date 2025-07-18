@@ -267,9 +267,8 @@ class FFN(nn.Module):
 class SimplifiedHypernetMoE(nn.Module):
     """
     Simplified pure PyTorch implementation of the hypernetwork MoE layer.
-    This version doesn't use the reordered execution pattern and is easier
-    to understand, though less efficient than the Triton kernel version
-    Only suitable for toy scale models.
+    This version implements the naive (non-reordered) execution pattern
+    as described in the paper.
     """
     def __init__(self, config):
         super().__init__()
@@ -292,47 +291,54 @@ class SimplifiedHypernetMoE(nn.Module):
         n_tokens = x_flat.shape[0]
         
         # Get routing decisions
-        scores, expert_indices = self.router(x_flat)
+        scores, expert_indices = self.router(x_flat)  # [n_tokens, num_heads, top_k]
         
-        # Get the generation network's weights (matching Triton)
+        # Get hypernetwork weights
         W1 = self.generation_network.net[0].weight.t()  # [d_latent, d_hidden]
         W2 = self.generation_network.net[2].weight.t()  # [d_hidden, 2*d_model]
-        
-        # Split W2 into projection matrices
         W_u = W2[:, :d_model].t()     # [d_model, d_hidden]
         W_v = W2[:, d_model:]         # [d_hidden, d_model]
         
-        # Process all experts
-        all_indices = expert_indices.view(-1)
-        all_scores = scores.view(n_tokens, -1)
+        # Initialize output
+        output = torch.zeros_like(x_flat)
         
-        # Get latent codes
-        all_latents = self.expert_latents(all_indices)  # [B*S*H*K, d_latent]
+        # Process each routing head
+        for head_idx in range(self.num_heads):
+            head_output = torch.zeros_like(x_flat)
+            
+            # Process each token
+            for token_idx in range(n_tokens):
+                token_x = x_flat[token_idx]  # [d_model]
+                token_output = torch.zeros(d_model).to(x.device)
+                
+                # Process each selected expert for this token
+                for k in range(self.top_k):
+                    expert_idx = expert_indices[token_idx, head_idx, k]
+                    score = scores[token_idx, head_idx, k]
+                    
+                    # Get expert latent
+                    z_i = self.expert_latents(expert_idx)  # [d_latent]
+                    
+                    # Generate expert hidden representation
+                    h_i = F.gelu(z_i @ W1)  # [d_hidden]
+                    
+                    # Project token to hidden space
+                    x_proj = token_x @ W_u  # [d_hidden]
+                    
+                    # Compute activation
+                    activation = F.gelu(torch.dot(h_i, x_proj)) * score  # scalar
+                    
+                    # Generate output contribution
+                    expert_output = activation * (h_i @ W_v)  # [d_model]
+                    
+                    token_output += expert_output
+                
+                head_output[token_idx] = token_output
+            
+            output += head_output
         
-        # Generate hidden representations (not full parameters!)
-        # h = GELU(latent @ W1)
-        h = F.gelu(all_latents @ W1)  # [B*S*H*K, d_hidden]
-        h = h.view(n_tokens, self.num_heads * self.top_k, -1)  # [B*S, H*K, d_hidden]
-        
-        # Project input to hidden space ONCE per token
-        x_proj = x_flat @ W_u  # [B*S, d_hidden]
-        
-        # Compute activations in hidden space
-        # activation = GELU(h · x_proj)
-        x_proj_expanded = x_proj.unsqueeze(1)  # [B*S, 1, d_hidden]
-        dot_products = (h * x_proj_expanded).sum(dim=-1)  # [B*S, H*K]
-        activations = F.gelu(dot_products)
-        
-        # Apply routing scores
-        weighted_activations = activations * all_scores  # [B*S, H*K]
-        
-        # Project back to token space
-        # output = sum((h @ W_v) * activation)
-        h_projected = h @ W_v  # [B*S, H*K, d_model]
-        weighted_outputs = h_projected * weighted_activations.unsqueeze(-1)
-        
-        # Sum over all experts and average across heads
-        output = weighted_outputs.sum(dim=1) / self.num_heads
+        # Average across heads
+        output = output / self.num_heads
         
         return output.view(batch_size, seq_len, d_model)
 

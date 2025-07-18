@@ -3,7 +3,8 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-This repository contains the implementation of ETHOS from the paper "Why Play the Lottery When You Can Just Win?"
+This repository contains the implementation of ETHOS from the paper "ETHOS: Efficient Transformers via
+Hypernetwork-Organized Sparsity"
 
 ETHOS is a novel architecture that dynamically generates millions of tiny experts from compressed latent representations, achieving 8.7B parameter capacity while using ~20× fewer FLOPs.
 
