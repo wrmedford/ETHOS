@@ -93,7 +93,7 @@ On 1% of C4 dataset:
 
 ```bibtex
 @article{medford2025ethos,
-  title={Why Play the Lottery When You Can Just Win?},
+  title={ETHOS: Efficient Transformers via Hypernetwork-Organized Sparsity},
   author={Medford, Wesley and McCormick, Chris and Callicoat, Eve},
   journal={arXiv preprint arXiv:2407.XXXXX},
   year={2025}
