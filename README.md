@@ -90,17 +90,6 @@ On 1% of C4 dataset:
 - Training speed: 15K tokens/second on GH200
 - Memory efficiency: 16× reduction vs PEER
 
-## Citation
-
-```bibtex
-@article{medford2025ethos,
-  title={ETHOS: Efficient Transformers via Hypernetwork-Organized Sparsity},
-  author={Medford, Wesley and McCormick, Chris and Callicoat, Eve},
-  journal={arXiv preprint arXiv:2407.XXXXX},
-  year={2025}
-}
-```
-
 ## License
 
 This project is licensed under the **GNU Affero General Public License v3.0 (AGPLv3)** - see the [LICENSE](LICENSE) file for details.
