@@ -124,26 +124,25 @@ def moe_reorder_fwd_kernel(
 
 @triton.jit
 def moe_reorder_bwd_kernel(
-    # Inputs from forward pass
+    # Forward inputs / params
     x_ptr,               # [B*S, d_model]
     latent_ptr,          # [num_experts, d_latent]
-    indices_ptr,         # [B*S, top_k]
+    indices_ptr,         # [B*S, top_k] (int)
     scores_ptr,          # [B*S, top_k]
-
     wu_ptr,              # [d_model, d_hidden]
     w1_ptr,              # [d_latent, d_hidden]
     wv_ptr,              # [d_hidden, d_model]
 
-    # Gradient input
-    grad_output_ptr,     # [B*S, d_model]
+    # Upstream gradient
+    dout_ptr,            # [B*S, d_model]
 
-    # Gradient outputs
-    grad_x_ptr,          # [B*S, d_model]
-    grad_latent_ptr,     # [num_experts, d_latent]
-    grad_wu_ptr,         # [d_model, d_hidden]
-    grad_w1_ptr,         # [d_latent, d_hidden]
-    grad_wv_ptr,         # [d_hidden, d_model]
-    grad_scores_ptr,     # [B*S, top_k]
+    # Backward outputs
+    dx_ptr,              # [B*S, d_model]
+    dlatent_ptr,         # [num_experts, d_latent]
+    dscores_ptr,         # [B*S, top_k]
+    dwu_ptr,             # [d_model, d_hidden]
+    dw1_ptr,             # [d_latent, d_hidden]
+    dwv_ptr,             # [d_hidden, d_model]
 
     # Dimensions
     batch_seq_size, d_model, d_latent, d_hidden, top_k,
@@ -152,21 +151,15 @@ def moe_reorder_bwd_kernel(
     stride_x_bs, stride_x_d,
     stride_idx_bs, stride_idx_k,
     stride_score_bs, stride_score_k,
-    stride_grad_out_bs, stride_grad_out_d,
-    stride_grad_x_bs, stride_grad_x_d,
+    stride_dout_bs, stride_dout_d,
+    stride_dx_bs, stride_dx_d,
     stride_latent_n, stride_latent_d,
-    stride_grad_latent_n, stride_grad_latent_d,
 
     stride_wu_row, stride_wu_col,
     stride_w1_row, stride_w1_col,
     stride_wv_row, stride_wv_col,
 
-    stride_grad_wu_row, stride_grad_wu_col,
-    stride_grad_w1_row, stride_grad_w1_col,
-    stride_grad_wv_row, stride_grad_wv_col,
-    stride_grad_score_bs, stride_grad_score_k,
-
-    # Block sizes
+    # Block sizes (compile-time constants)
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DHIDDEN: tl.constexpr,
 ):
@@ -180,12 +173,17 @@ def moe_reorder_bwd_kernel(
     if pid >= batch_seq_size:
         return
 
+    a = 1.702  # GELU(sigmoid) approximation factor used in fwd
+
     d_offs = tl.arange(0, BLOCK_DMODEL)
     h_offs = tl.arange(0, BLOCK_DHIDDEN)
     h_mask = h_offs < d_hidden
 
-    # Step 1: Recompute x_proj (same as forward - key optimization!)
+    # -------------------------------------------------------------------------
+    # Recompute x_proj = x @ W_u  (same as fwd)
+    # -------------------------------------------------------------------------
     x_proj = tl.zeros([BLOCK_DHIDDEN], dtype=tl.float32)
+
     for d_start in range(0, d_model, BLOCK_DMODEL):
         d_chunk = d_start + d_offs
         x_mask = d_chunk < d_model
@@ -195,224 +193,166 @@ def moe_reorder_bwd_kernel(
             mask=x_mask,
             other=0.0,
         )
+        w_chunk = tl.load(
+            wu_ptr + d_chunk[:, None] * stride_wu_row + h_offs[None, :] * stride_wu_col,
+            mask=x_mask[:, None] & h_mask[None, :],
+            other=0.0,
+        )
+        x_proj += tl.sum(x_chunk[:, None] * w_chunk, axis=0)
 
+    # Accumulate gradient w.r.t x_proj from all experts
+    g_x_proj = tl.zeros([BLOCK_DHIDDEN], dtype=tl.float32)
+
+    # -------------------------------------------------------------------------
+    # Loop over top-k experts
+    # -------------------------------------------------------------------------
+    for k in range(top_k):
+        expert_idx = tl.load(indices_ptr + pid * stride_idx_bs + k * stride_idx_k)
+        score = tl.load(scores_ptr + pid * stride_score_bs + k * stride_score_k)
+
+        # ---- Forward recompute: z = latent[e] @ W1, then h = GELU(z) (sigmoid approximation)
+        z = tl.zeros([BLOCK_DHIDDEN], dtype=tl.float32)
+        for l in range(0, d_latent):
+            latent_val = tl.load(latent_ptr + expert_idx * stride_latent_n + l * stride_latent_d)
+            w1_row = tl.load(
+                w1_ptr + l * stride_w1_row + h_offs * stride_w1_col,
+                mask=h_mask,
+                other=0.0,
+            )
+            z += latent_val * w1_row
+
+        s_z = tl.sigmoid(a * z)
+        h = z * s_z  # GELU approx used in fwd
+
+        # dot = h · x_proj
+        dot = tl.sum(h * x_proj)
+
+        # activation = GELU(dot) * score, with same GELU(sigmoid) approx
+        s_dot = tl.sigmoid(a * dot)
+        gelu_dot = dot * s_dot
+        activation = gelu_dot * score
+
+        # ---------------------------------------------------------------------
+        # Backprop through output = sum_k activation * (h @ W_v)
+        # Need: g_act, gh_from_y, dWv, then back through dot and h
+        # ---------------------------------------------------------------------
+        g_act = tl.zeros([1], dtype=tl.float32)
+        gh = tl.zeros([BLOCK_DHIDDEN], dtype=tl.float32)
+
+        for d_start in range(0, d_model, BLOCK_DMODEL):
+            d_chunk = d_start + d_offs
+            x_mask = d_chunk < d_model
+
+            # y_chunk = (h @ W_v)_chunk
+            wv_block = tl.load(
+                wv_ptr + h_offs[:, None] * stride_wv_row + d_chunk[None, :] * stride_wv_col,
+                mask=h_mask[:, None] & x_mask[None, :],
+                other=0.0,
+            )
+            y_chunk = tl.sum(h[:, None] * wv_block, axis=0)
+
+            # upstream gradient chunk
+            gout_chunk = tl.load(
+                dout_ptr + pid * stride_dout_bs + d_chunk * stride_dout_d,
+                mask=x_mask,
+                other=0.0,
+            )
+
+            # g_act accumulates <gout, y>
+            g_act += tl.sum(gout_chunk * y_chunk)
+
+            # gy = gout * activation
+            gy_chunk = gout_chunk * activation
+
+            # dWv += h[:, None] * gy[None, :]
+            dWv_tile = h[:, None] * gy_chunk[None, :]
+            tl.atomic_add(
+                dwv_ptr + h_offs[:, None] * stride_wv_row + d_chunk[None, :] * stride_wv_col,
+                dWv_tile,
+                mask=h_mask[:, None] & x_mask[None, :],
+            )
+
+            # gh_from_y += W_v @ gy
+            gh += tl.sum(wv_block * gy_chunk[None, :], axis=1)
+
+        # Backprop through activation = GELU(dot) * score
+        # d activation / d dot = gelu'(dot) * score
+        # gelu'(t) for t*sigmoid(a t) = s + a*t*s*(1 - s) where s = sigmoid(a t)
+        gelu_prime_dot = s_dot + a * dot * s_dot * (1.0 - s_dot)
+
+        coeff = g_act * gelu_prime_dot * score  # scalar
+        # x_proj path from dot
+        g_x_proj += coeff * h
+        # h path from dot
+        gh += coeff * x_proj
+
+        # d score
+        tl.store(
+            dscores_ptr + pid * stride_score_bs + k * stride_score_k,
+            g_act * gelu_dot,
+        )
+
+        # Backprop through h = GELU(z)
+        gelu_prime_z = s_z + a * z * s_z * (1.0 - s_z)  # elementwise
+        gz = gh * gelu_prime_z
+
+        # Backprop through z = latent[e] @ W1
+        for l in range(0, d_latent):
+            latent_val = tl.load(latent_ptr + expert_idx * stride_latent_n + l * stride_latent_d)
+            w1_row = tl.load(
+                w1_ptr + l * stride_w1_row + h_offs * stride_w1_col,
+                mask=h_mask,
+                other=0.0,
+            )
+
+            # dW1[l, :] += latent_val * gz[:]
+            tl.atomic_add(
+                dw1_ptr + l * stride_w1_row + h_offs * stride_w1_col,
+                latent_val * gz,
+                mask=h_mask,
+            )
+
+            # dlatent[e, l] += <gz, W1[l, :]>
+            dlatent_val = tl.sum(gz * w1_row)
+            tl.atomic_add(
+                dlatent_ptr + expert_idx * stride_latent_n + l * stride_latent_d,
+                dlatent_val,
+            )
+
+    # -------------------------------------------------------------------------
+    # Finish: backprop through x_proj = x @ W_u
+    # dx and dWu
+    # -------------------------------------------------------------------------
+    for d_start in range(0, d_model, BLOCK_DMODEL):
+        d_chunk = d_start + d_offs
+        x_mask = d_chunk < d_model
+
+        x_chunk = tl.load(
+            x_ptr + pid * stride_x_bs + d_chunk * stride_x_d,
+            mask=x_mask,
+            other=0.0,
+        )
         w_chunk = tl.load(
             wu_ptr + d_chunk[:, None] * stride_wu_row + h_offs[None, :] * stride_wu_col,
             mask=x_mask[:, None] & h_mask[None, :],
             other=0.0,
         )
 
-        x_proj += tl.sum(x_chunk[:, None] * w_chunk, axis=0)
-
-    # Initialize gradient accumulators
-    grad_x = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
-    grad_x_proj = tl.zeros([BLOCK_DHIDDEN], dtype=tl.float32)
-
-    # Step 2: Process each expert (backward through expert loop)
-    for k in range(top_k):
-        expert_idx = tl.load(indices_ptr + pid * stride_idx_bs + k * stride_idx_k)
-        score = tl.load(scores_ptr + pid * stride_score_bs + k * stride_score_k)
-
-        # Recompute forward values needed for backward
-        # h = GELU(latent @ W1)
-        h = tl.zeros([BLOCK_DHIDDEN], dtype=tl.float32)
-        latent = tl.zeros([d_latent], dtype=tl.float32)
-
-        for l in range(d_latent):
-            latent_val = tl.load(latent_ptr + expert_idx * stride_latent_n + l * stride_latent_d)
-            latent = tl.where(l < d_latent, latent_val, latent)  # Store for later
-            w1_row = tl.load(
-                w1_ptr + l * stride_w1_row + h_offs * stride_w1_col,
-                mask=h_mask,
-                other=0.0,
-            )
-            h += latent_val * w1_row
-
-        # GELU activation
-        h_pre_gelu = h
-        sigmoid_arg = 1.702 * h_pre_gelu
-        h = h_pre_gelu * tl.sigmoid(sigmoid_arg)
-
-        # Recompute dot and activation
-        dot = tl.sum(h * x_proj)
-        dot_sigmoid_arg = 1.702 * dot
-        activation = dot * tl.sigmoid(dot_sigmoid_arg) * score
-
-        # === Backward pass ===
-
-        # Load grad_output for this token
-        grad_out_token = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
-        for d_start in range(0, d_model, BLOCK_DMODEL):
-            d_chunk = d_start + d_offs
-            x_mask = d_chunk < d_model
-            grad_chunk = tl.load(
-                grad_output_ptr + pid * stride_grad_out_bs + d_chunk * stride_grad_out_d,
-                mask=x_mask,
-                other=0.0,
-            )
-            grad_out_token = tl.where(x_mask, grad_chunk, grad_out_token)
-
-        # Backward through: output += activation * (h @ W_v)
-        # grad_activation = sum(grad_output * (h @ W_v))
-        grad_activation = tl.zeros([1], dtype=tl.float32)
-        grad_h_from_output = tl.zeros([BLOCK_DHIDDEN], dtype=tl.float32)
-
-        for d_start in range(0, d_model, BLOCK_DMODEL):
-            d_chunk = d_start + d_offs
-            x_mask = d_chunk < d_model
-
-            # Load W_v for this chunk
-            wv_block = tl.load(
-                wv_ptr + h_offs[:, None] * stride_wv_row + d_chunk[None, :] * stride_wv_col,
-                mask=h_mask[:, None] & x_mask[None, :],
-                other=0.0,
-            )
-
-            # h @ W_v for this chunk
-            h_wv_chunk = tl.sum(h[:, None] * wv_block, axis=0)
-
-            # grad_activation += grad_output * (h @ W_v)
-            grad_out_chunk = tl.load(
-                grad_output_ptr + pid * stride_grad_out_bs + d_chunk * stride_grad_out_d,
-                mask=x_mask,
-                other=0.0,
-            )
-            grad_activation += tl.sum(grad_out_chunk * h_wv_chunk)
-
-            # grad_h += activation * grad_output @ W_v.T
-            grad_h_from_output += tl.sum(grad_out_chunk[None, :] * wv_block, axis=1) * activation
-
-            # grad_W_v[h, d] += h[h] * (activation * grad_output[d])
-            # Compute activation * grad_output for this chunk
-            scaled_grad_out = activation * grad_out_chunk
-
-            # Compute outer product: h[:, None] * scaled_grad_out[None, :]
-            # Result is [BLOCK_DHIDDEN, BLOCK_DMODEL]
-            grad_wv_contribution = h[:, None] * scaled_grad_out[None, :]
-
-            # Mask out-of-bounds contributions
-            valid_mask = h_mask[:, None] & x_mask[None, :]
-            grad_wv_contribution = tl.where(valid_mask, grad_wv_contribution, 0.0)
-
-            # Atomic add to grad_W_v using vectorized approach
-            # Note: We need to flatten this to do atomic adds
-            wv_row_offs = h_offs[:, None]
-            wv_col_offs = d_chunk[None, :]
-            wv_ptrs = grad_wv_ptr + wv_row_offs * stride_grad_wv_row + wv_col_offs * stride_grad_wv_col
-
-            # Store atomically - Triton will handle this element-wise
-            tl.atomic_add(wv_ptrs, grad_wv_contribution, mask=valid_mask)
-
-        # Backward through: activation = GELU(dot) * score
-        # GELU'(x) = sigmoid(1.702*x) * (1 + 1.702*x*(1-sigmoid(1.702*x)))
-        sigmoid_val = tl.sigmoid(dot_sigmoid_arg)
-        gelu_grad = sigmoid_val * (1.0 + dot_sigmoid_arg * (1.0 - sigmoid_val))
-        grad_dot = grad_activation * gelu_grad * score
-        grad_score = grad_activation * (dot * sigmoid_val)
-
-        # Store grad_score
+        # dx_chunk = g_x_proj @ W_u^T  (i.e., sum_h g_x_proj[h] * W_u[d, h])
+        dx_chunk = tl.sum(g_x_proj[None, :] * w_chunk, axis=1)
         tl.store(
-            grad_scores_ptr + pid * stride_grad_score_bs + k * stride_grad_score_k,
-            grad_score,
-        )
-
-        # Backward through: dot = sum(h * x_proj)
-        grad_h_from_dot = grad_dot * x_proj
-        grad_x_proj += grad_dot * h
-
-        # Combine gradients for h
-        grad_h_total = grad_h_from_output + grad_h_from_dot
-
-        # Backward through: h = GELU(h_pre_gelu)
-        sigmoid_h = tl.sigmoid(sigmoid_arg)
-        gelu_grad_h = sigmoid_h * (1.0 + sigmoid_arg * (1.0 - sigmoid_h))
-        grad_h_pre_gelu = grad_h_total * gelu_grad_h
-
-        # Backward through: h_pre_gelu = latent @ W1
-        # grad_latent = grad_h_pre_gelu @ W1.T  [d_hidden] @ [d_hidden, d_latent] = [d_latent]
-        # grad_W1 = latent^T @ grad_h_pre_gelu  [d_latent, 1] @ [1, d_hidden] = [d_latent, d_hidden]
-
-        # Compute grad_latent and accumulate to global memory with atomics
-        for l in range(d_latent):
-            # grad_latent[expert_idx, l] = sum over h_dim of: grad_h_pre_gelu[h] * W1[l, h]
-            grad_lat_val = 0.0
-
-            # Load W1[l, :] and compute dot product with grad_h_pre_gelu
-            w1_row = tl.load(
-                w1_ptr + l * stride_w1_row + h_offs * stride_w1_col,
-                mask=h_mask,
-                other=0.0
-            )
-            grad_lat_val = tl.sum(w1_row * grad_h_pre_gelu)
-
-            # Atomic add to grad_latent[expert_idx, l]
-            tl.atomic_add(
-                grad_latent_ptr + expert_idx * stride_grad_latent_n + l * stride_grad_latent_d,
-                grad_lat_val
-            )
-
-        # Compute grad_W1 and accumulate with atomics
-        # grad_W1[l, h] += latent[l] * grad_h_pre_gelu[h]
-        for l in range(d_latent):
-            latent_val = tl.load(latent_ptr + expert_idx * stride_latent_n + l * stride_latent_d)
-
-            # Vectorized atomic add for this row of grad_W1
-            grad_w1_contribution = latent_val * grad_h_pre_gelu
-
-            # Mask out-of-bounds elements (set to 0)
-            grad_w1_contribution = tl.where(h_mask, grad_w1_contribution, 0.0)
-
-            # Compute pointer offsets for this row
-            w1_ptrs = grad_w1_ptr + l * stride_grad_w1_row + h_offs * stride_grad_w1_col
-
-            # Atomic add with masking
-            tl.atomic_add(w1_ptrs, grad_w1_contribution, mask=h_mask)
-
-    # Step 3: Backward through x_proj = x @ W_u (computed ONCE - key optimization!)
-    # grad_x += grad_x_proj @ W_u.T  [d_hidden] @ [d_hidden, d_model] = [d_model]
-    # grad_W_u += x^T @ grad_x_proj  [d_model, 1] @ [1, d_hidden] = [d_model, d_hidden]
-    for d_start in range(0, d_model, BLOCK_DMODEL):
-        d_chunk = d_start + d_offs
-        x_mask = d_chunk < d_model
-
-        wu_chunk = tl.load(
-            wu_ptr + d_chunk[:, None] * stride_wu_row + h_offs[None, :] * stride_wu_col,
-            mask=x_mask[:, None] & h_mask[None, :],
-            other=0.0,
-        )
-
-        # Load x for this chunk (needed for grad_W_u)
-        x_chunk = tl.load(
-            x_ptr + pid * stride_x_bs + d_chunk * stride_x_d,
+            dx_ptr + pid * stride_dx_bs + d_chunk * stride_dx_d,
+            dx_chunk,
             mask=x_mask,
-            other=0.0,
         )
 
-        # Compute grad_x for this chunk
-        grad_x_chunk = tl.sum(grad_x_proj[None, :] * wu_chunk, axis=1)
-
-        # Store grad_x
-        out_offset = pid * stride_grad_x_bs + d_chunk * stride_grad_x_d
-        old_grad = tl.load(grad_x_ptr + out_offset, mask=x_mask, other=0.0)
-        tl.store(grad_x_ptr + out_offset, old_grad + grad_x_chunk, mask=x_mask)
-
-        # Compute and accumulate grad_W_u with atomics
-        # grad_W_u[d, h] += x[d] * grad_x_proj[h]
-        # Compute outer product: x_chunk[:, None] * grad_x_proj[None, :]
-        # Result is [BLOCK_DMODEL, BLOCK_DHIDDEN]
-        grad_wu_contribution = x_chunk[:, None] * grad_x_proj[None, :]
-
-        # Mask out-of-bounds contributions
-        valid_mask_wu = x_mask[:, None] & h_mask[None, :]
-        grad_wu_contribution = tl.where(valid_mask_wu, grad_wu_contribution, 0.0)
-
-        # Compute pointer offsets
-        wu_row_offs = d_chunk[:, None]
-        wu_col_offs = h_offs[None, :]
-        wu_ptrs = grad_wu_ptr + wu_row_offs * stride_grad_wu_row + wu_col_offs * stride_grad_wu_col
-
-        # Atomic add with masking
-        tl.atomic_add(wu_ptrs, grad_wu_contribution, mask=valid_mask_wu)
+        # dW_u[d, h] += x[d] * g_x_proj[h]
+        dWu_tile = x_chunk[:, None] * g_x_proj[None, :]
+        tl.atomic_add(
+            dwu_ptr + d_chunk[:, None] * stride_wu_row + h_offs[None, :] * stride_wu_col,
+            dWu_tile,
+            mask=x_mask[:, None] & h_mask[None, :],
+        )
 
 
 class ExpertGenerationNetwork(nn.Module):
@@ -615,26 +555,25 @@ class MoEFunction(torch.autograd.Function):
         grid = (n_tokens,)
 
         moe_reorder_bwd_kernel[grid](
-            # Inputs from forward pass
+            # Forward inputs / params
             x_flat,
             expert_latents,
             indices,
             scores,
-
             W_u,
             W1,
             W_v,
 
-            # Gradient input
+            # Upstream gradient
             grad_output.contiguous(),
 
-            # Gradient outputs
+            # Backward outputs
             grad_x,
             grad_latent,
+            grad_scores,
             grad_wu,
             grad_w1,
             grad_wv,
-            grad_scores,
 
             # Dimensions
             n_tokens,
@@ -650,16 +589,10 @@ class MoEFunction(torch.autograd.Function):
             grad_output.stride(0), grad_output.stride(1),
             grad_x.stride(0), grad_x.stride(1),
             expert_latents.stride(0), expert_latents.stride(1),
-            grad_latent.stride(0), grad_latent.stride(1),
 
             W_u.stride(0), W_u.stride(1),
             W1.stride(0), W1.stride(1),
             W_v.stride(0), W_v.stride(1),
-
-            grad_wu.stride(0), grad_wu.stride(1),
-            grad_w1.stride(0), grad_w1.stride(1),
-            grad_wv.stride(0), grad_wv.stride(1),
-            grad_scores.stride(0), grad_scores.stride(1),
 
             # Block sizes
             BLOCK_DMODEL=BLOCK_DMODEL,
