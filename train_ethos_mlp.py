@@ -462,18 +462,41 @@ model = torch.compile(model)
 ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
 
 # collect the parameters to optimize
-# For MoE, we need to handle the new components
+# For MoE, we need to handle the new components carefully
 hidden_matrix_params = []
+moe_embed_params = []  # Expert latents and router keys (conceptually 1D)
+
 for name, p in model.named_parameters():
     if p.ndim == 2:
-        # Include standard 2D params (attention, some MLP components)
-        # Exclude embedding tables from Muon
-        if 'embed' not in name and 'lm_head' not in name:
+        # Exclude from Muon:
+        # 1. Token embeddings and value embeddings
+        # 2. LM head (tied with token embeddings)
+        # 3. Expert latents (conceptually 1D vectors stored in 2D table)
+        # 4. Router sub-keys (conceptually 1D keys stored in 2D table)
+        if 'embed' in name or 'lm_head' in name:
+            continue
+        elif 'expert_latents' in name or 'sub_keys' in name:
+            # These are embedding tables - conceptually 1D, stored as 2D
+            moe_embed_params.append(p)
+        else:
+            # True 2D matrices: attention weights, generation network weights, router projections
             hidden_matrix_params.append(p)
 
-embed_params = [model.embed.weight, *model.value_embeds.parameters()]
+embed_params = [model.embed.weight, *model.value_embeds.parameters(), *moe_embed_params]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
+
+# Verify parameter allocation (debug logging)
+if master_process:
+    print0(f'Parameter allocation:')
+    print0(f'  Muon (2D matrices): {len(hidden_matrix_params)} params, {sum(p.numel() for p in hidden_matrix_params):,} elements')
+    print0(f'  Adam (embeddings): {len(embed_params)} params, {sum(p.numel() for p in embed_params):,} elements')
+    print0(f'  Adam (lm_head): {len(head_params)} params, {sum(p.numel() for p in head_params):,} elements')
+    print0(f'  Adam (scalars): {len(scalar_params)} params, {sum(p.numel() for p in scalar_params):,} elements')
+    # List MoE-specific params
+    moe_param_names = [name for name, p in model.named_parameters() if 'expert_latents' in name or 'sub_keys' in name]
+    if moe_param_names:
+        print0(f'  MoE embedding params (in Adam): {moe_param_names[:5]}{"..." if len(moe_param_names) > 5 else ""}')
 
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([dict(params=embed_params, lr=0.6),
