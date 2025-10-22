@@ -286,16 +286,22 @@ def moe_reorder_bwd_kernel(
             # Compute activation * grad_output for this chunk
             scaled_grad_out = activation * grad_out_chunk
 
-            # Atomic add to grad_W_v
-            for h_idx in range(BLOCK_DHIDDEN):
-                if h_idx < d_hidden:
-                    h_val = h[h_idx]
-                    for d_idx in range(BLOCK_DMODEL):
-                        if d_start + d_idx < d_model:
-                            tl.atomic_add(
-                                grad_wv_ptr + h_idx * stride_grad_wv_row + (d_start + d_idx) * stride_grad_wv_col,
-                                h_val * scaled_grad_out[d_idx]
-                            )
+            # Compute outer product: h[:, None] * scaled_grad_out[None, :]
+            # Result is [BLOCK_DHIDDEN, BLOCK_DMODEL]
+            grad_wv_contribution = h[:, None] * scaled_grad_out[None, :]
+
+            # Mask out-of-bounds contributions
+            valid_mask = h_mask[:, None] & x_mask[None, :]
+            grad_wv_contribution = tl.where(valid_mask, grad_wv_contribution, 0.0)
+
+            # Atomic add to grad_W_v using vectorized approach
+            # Note: We need to flatten this to do atomic adds
+            wv_row_offs = h_offs[:, None]
+            wv_col_offs = d_chunk[None, :]
+            wv_ptrs = grad_wv_ptr + wv_row_offs * stride_grad_wv_row + wv_col_offs * stride_grad_wv_col
+
+            # Store atomically - Triton will handle this element-wise
+            tl.atomic_add(wv_ptrs, grad_wv_contribution, mask=valid_mask)
 
         # Backward through: activation = GELU(dot) * score
         # GELU'(x) = sigmoid(1.702*x) * (1 + 1.702*x*(1-sigmoid(1.702*x)))
@@ -353,13 +359,14 @@ def moe_reorder_bwd_kernel(
             # Vectorized atomic add for this row of grad_W1
             grad_w1_contribution = latent_val * grad_h_pre_gelu
 
-            # Atomic add across the hidden dimension
-            for h_idx in range(BLOCK_DHIDDEN):
-                if h_idx < d_hidden:
-                    tl.atomic_add(
-                        grad_w1_ptr + l * stride_grad_w1_row + h_idx * stride_grad_w1_col,
-                        grad_w1_contribution[h_idx]
-                    )
+            # Mask out-of-bounds elements (set to 0)
+            grad_w1_contribution = tl.where(h_mask, grad_w1_contribution, 0.0)
+
+            # Compute pointer offsets for this row
+            w1_ptrs = grad_w1_ptr + l * stride_grad_w1_row + h_offs * stride_grad_w1_col
+
+            # Atomic add with masking
+            tl.atomic_add(w1_ptrs, grad_w1_contribution, mask=h_mask)
 
     # Step 3: Backward through x_proj = x @ W_u (computed ONCE - key optimization!)
     # grad_x += grad_x_proj @ W_u.T  [d_hidden] @ [d_hidden, d_model] = [d_model]
@@ -391,15 +398,21 @@ def moe_reorder_bwd_kernel(
 
         # Compute and accumulate grad_W_u with atomics
         # grad_W_u[d, h] += x[d] * grad_x_proj[h]
-        for d_idx in range(BLOCK_DMODEL):
-            if d_start + d_idx < d_model:
-                x_val = x_chunk[d_idx]
-                for h_idx in range(BLOCK_DHIDDEN):
-                    if h_idx < d_hidden:
-                        tl.atomic_add(
-                            grad_wu_ptr + (d_start + d_idx) * stride_grad_wu_row + h_idx * stride_grad_wu_col,
-                            x_val * grad_x_proj[h_idx]
-                        )
+        # Compute outer product: x_chunk[:, None] * grad_x_proj[None, :]
+        # Result is [BLOCK_DMODEL, BLOCK_DHIDDEN]
+        grad_wu_contribution = x_chunk[:, None] * grad_x_proj[None, :]
+
+        # Mask out-of-bounds contributions
+        valid_mask_wu = x_mask[:, None] & h_mask[None, :]
+        grad_wu_contribution = tl.where(valid_mask_wu, grad_wu_contribution, 0.0)
+
+        # Compute pointer offsets
+        wu_row_offs = d_chunk[:, None]
+        wu_col_offs = h_offs[None, :]
+        wu_ptrs = grad_wu_ptr + wu_row_offs * stride_grad_wu_row + wu_col_offs * stride_grad_wu_col
+
+        # Atomic add with masking
+        tl.atomic_add(wu_ptrs, grad_wu_contribution, mask=valid_mask_wu)
 
 
 class ExpertGenerationNetwork(nn.Module):
