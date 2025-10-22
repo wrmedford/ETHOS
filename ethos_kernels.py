@@ -282,7 +282,20 @@ def moe_reorder_bwd_kernel(
             # grad_h += activation * grad_output @ W_v.T
             grad_h_from_output += tl.sum(grad_out_chunk[None, :] * wv_block, axis=1) * activation
 
-            # grad_W_v += h^T @ (activation * grad_output) - accumulated atomically later
+            # grad_W_v[h, d] += h[h] * (activation * grad_output[d])
+            # Compute activation * grad_output for this chunk
+            scaled_grad_out = activation * grad_out_chunk
+
+            # Atomic add to grad_W_v
+            for h_idx in range(BLOCK_DHIDDEN):
+                if h_idx < d_hidden:
+                    h_val = h[h_idx]
+                    for d_idx in range(BLOCK_DMODEL):
+                        if d_start + d_idx < d_model:
+                            tl.atomic_add(
+                                grad_wv_ptr + h_idx * stride_grad_wv_row + (d_start + d_idx) * stride_grad_wv_col,
+                                h_val * scaled_grad_out[d_idx]
+                            )
 
         # Backward through: activation = GELU(dot) * score
         # GELU'(x) = sigmoid(1.702*x) * (1 + 1.702*x*(1-sigmoid(1.702*x)))
@@ -310,11 +323,47 @@ def moe_reorder_bwd_kernel(
         grad_h_pre_gelu = grad_h_total * gelu_grad_h
 
         # Backward through: h_pre_gelu = latent @ W1
-        # grad_latent = grad_h_pre_gelu @ W1.T
-        # grad_W1 = latent^T @ grad_h_pre_gelu - accumulated atomically later
+        # grad_latent = grad_h_pre_gelu @ W1.T  [d_hidden] @ [d_hidden, d_latent] = [d_latent]
+        # grad_W1 = latent^T @ grad_h_pre_gelu  [d_latent, 1] @ [1, d_hidden] = [d_latent, d_hidden]
+
+        # Compute grad_latent and accumulate to global memory with atomics
+        for l in range(d_latent):
+            # grad_latent[expert_idx, l] = sum over h_dim of: grad_h_pre_gelu[h] * W1[l, h]
+            grad_lat_val = 0.0
+
+            # Load W1[l, :] and compute dot product with grad_h_pre_gelu
+            w1_row = tl.load(
+                w1_ptr + l * stride_w1_row + h_offs * stride_w1_col,
+                mask=h_mask,
+                other=0.0
+            )
+            grad_lat_val = tl.sum(w1_row * grad_h_pre_gelu)
+
+            # Atomic add to grad_latent[expert_idx, l]
+            tl.atomic_add(
+                grad_latent_ptr + expert_idx * stride_grad_latent_n + l * stride_grad_latent_d,
+                grad_lat_val
+            )
+
+        # Compute grad_W1 and accumulate with atomics
+        # grad_W1[l, h] += latent[l] * grad_h_pre_gelu[h]
+        for l in range(d_latent):
+            latent_val = tl.load(latent_ptr + expert_idx * stride_latent_n + l * stride_latent_d)
+
+            # Vectorized atomic add for this row of grad_W1
+            grad_w1_contribution = latent_val * grad_h_pre_gelu
+
+            # Atomic add across the hidden dimension
+            for h_idx in range(BLOCK_DHIDDEN):
+                if h_idx < d_hidden:
+                    tl.atomic_add(
+                        grad_w1_ptr + l * stride_grad_w1_row + h_idx * stride_grad_w1_col,
+                        grad_w1_contribution[h_idx]
+                    )
 
     # Step 3: Backward through x_proj = x @ W_u (computed ONCE - key optimization!)
-    # grad_x += grad_x_proj @ W_u.T
+    # grad_x += grad_x_proj @ W_u.T  [d_hidden] @ [d_hidden, d_model] = [d_model]
+    # grad_W_u += x^T @ grad_x_proj  [d_model, 1] @ [1, d_hidden] = [d_model, d_hidden]
     for d_start in range(0, d_model, BLOCK_DMODEL):
         d_chunk = d_start + d_offs
         x_mask = d_chunk < d_model
@@ -325,12 +374,32 @@ def moe_reorder_bwd_kernel(
             other=0.0,
         )
 
+        # Load x for this chunk (needed for grad_W_u)
+        x_chunk = tl.load(
+            x_ptr + pid * stride_x_bs + d_chunk * stride_x_d,
+            mask=x_mask,
+            other=0.0,
+        )
+
+        # Compute grad_x for this chunk
         grad_x_chunk = tl.sum(grad_x_proj[None, :] * wu_chunk, axis=1)
 
         # Store grad_x
         out_offset = pid * stride_grad_x_bs + d_chunk * stride_grad_x_d
         old_grad = tl.load(grad_x_ptr + out_offset, mask=x_mask, other=0.0)
         tl.store(grad_x_ptr + out_offset, old_grad + grad_x_chunk, mask=x_mask)
+
+        # Compute and accumulate grad_W_u with atomics
+        # grad_W_u[d, h] += x[d] * grad_x_proj[h]
+        for d_idx in range(BLOCK_DMODEL):
+            if d_start + d_idx < d_model:
+                x_val = x_chunk[d_idx]
+                for h_idx in range(BLOCK_DHIDDEN):
+                    if h_idx < d_hidden:
+                        tl.atomic_add(
+                            grad_wu_ptr + (d_start + d_idx) * stride_grad_wu_row + h_idx * stride_grad_wu_col,
+                            x_val * grad_x_proj[h_idx]
+                        )
 
 
 class ExpertGenerationNetwork(nn.Module):
