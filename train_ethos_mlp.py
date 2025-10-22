@@ -197,8 +197,8 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
 
     def __init__(self, model_dim, num_heads, use_attn=True,
-                 num_experts=64, top_k=2, d_latent=32,
-                 d_intermediate_hypernet=512, d_query=64, num_routing_heads=4):
+                 num_experts=64, top_k=16, d_latent=32,
+                 d_intermediate_hypernet=512, d_query=64, num_routing_heads=8):
         super().__init__()
         self.attn = CausalSelfAttention(model_dim, num_heads) if use_attn else None
         # Use ETHOS MoE instead of standard MLP
@@ -237,8 +237,8 @@ class ValueEmbedding(nn.Module):
 class GPT(nn.Module):
 
     def __init__(self, vocab_size, num_layers, num_heads, model_dim,
-                 num_experts=64, top_k=2, d_latent=32,
-                 d_intermediate_hypernet=512, d_query=64, num_routing_heads=4):
+                 num_experts=64, top_k=16, d_latent=32,
+                 d_intermediate_hypernet=512, d_query=64, num_routing_heads=8):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
@@ -392,11 +392,11 @@ class Hyperparameters:
     bf16_embeds = True
     # MoE parameters
     num_experts = 64
-    top_k = 2
+    top_k = 16
     d_latent = 32
     d_intermediate_hypernet = 512
     d_query = 64
-    num_routing_heads = 4
+    num_routing_heads = 8
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
