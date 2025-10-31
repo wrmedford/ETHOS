@@ -15,6 +15,7 @@ venv/
 *.jsonl
 *.csv
 training_logs/
+logs/
 c4_tokenized_cache/
 checkpoints/
 *.pt
